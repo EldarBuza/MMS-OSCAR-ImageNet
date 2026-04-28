@@ -161,3 +161,6 @@ dmypy.json
 cython_debug/
 
 .idea/
+
+CLAUDE.md
+.claude/
