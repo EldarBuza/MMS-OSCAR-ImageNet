@@ -1,9 +1,13 @@
 import os
 import sys
 
-import utils.utils_image as utils
-
 sys.path.append(os.getcwd())
+
+# Windows ROCm PyTorch is USE_DISTRIBUTED=0; shim torch.distributed before any
+# library that imports symbols from it (vector_quantize_pytorch in particular).
+from diffusion import _compat_torch_distributed  # noqa: F401
+
+import utils.utils_image as utils
 import argparse
 import torch
 from torchvision import transforms
@@ -76,7 +80,10 @@ if __name__ == "__main__":
     device = 'cuda'
     psnr_metric = pyiqa.create_metric('psnr', device="cuda")
     lpips_metric = pyiqa.create_metric('lpips-vgg', device="cuda")
-    dists_metric = pyiqa.create_metric('dists', device="cuda")
+    # DISTS on CUDA fp32 emits NaN on Windows ROCm 7.2.1 (RDNA 4) — VGG feature
+    # extractor produces NaN from stage 2 onward. CPU DISTS is correct (verified)
+    # and ~82 ms/call, so we run DISTS on CPU and pass .cpu() inputs at call time.
+    dists_metric = pyiqa.create_metric('dists', device="cpu")
     musiq_metric = pyiqa.create_metric('musiq', device="cuda")
     clipiqa_metric = pyiqa.create_metric('clipiqa+', device="cuda")
     msssim_metric = pyiqa.create_metric('ms_ssim', device="cuda")
@@ -108,8 +115,14 @@ if __name__ == "__main__":
             # get caption
             lq = tensor_transforms(img_H.copy()).unsqueeze(0).to(device)
             lq = lq * 2 - 1
-            with torch.no_grad():
+            with torch.no_grad(), torch.autocast(
+                device_type="cuda",
+                dtype=weight_dtype,
+                enabled=(weight_dtype != torch.float32),
+            ):
                 img_E, _, _ = model(lq, level)
+            # Autocast may emit fp16 tensors; metrics + saving expect fp32 RGB.
+            img_E = img_E.float()
 
             img_H = np.array(img_H)
             img_E = transforms.ToPILImage()(img_E[0].cpu() * 0.5 + 0.5)
@@ -123,7 +136,8 @@ if __name__ == "__main__":
 
             psnr = psnr_metric(img_E, img_H)
             lpips = lpips_metric(img_E, img_H)
-            dists = dists_metric(img_E, img_H)
+            # DISTS metric lives on CPU (ROCm fp32 nan workaround) — copy tensors over.
+            dists = dists_metric(img_E.cpu(), img_H.cpu())
             musiq = musiq_metric(img_E, img_H)
             clipiqa = clipiqa_metric(img_E, img_H)
             msssim = msssim_metric(img_E, img_H)

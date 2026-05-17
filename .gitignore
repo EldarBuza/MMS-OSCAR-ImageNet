@@ -164,3 +164,9 @@ cython_debug/
 
 CLAUDE.md
 .claude/
+
+# AMD/ROCm venv (created on 9070 XT box)
+oscar_env_amd/
+model_zoo/
+data/imagenet_val/
+results/
