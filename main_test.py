@@ -25,18 +25,42 @@ tensor_transforms = transforms.Compose([
     transforms.ToTensor(),
 ])
 
-def center_crop(image, target_width, target_height):
-    # 获取原始图像的尺寸
-    width, height = image.size
+# Fixed input size for all evaluations on ImageNet. Reasons:
+#  - mod-128 trim from the original repo breaks on ImageNet's diverse aspect
+#    ratios (60-3264 px range): tiny images zero-out, huge images blow up runtime
+#    quadratically, and pyiqa MS-SSIM (5 scales x 11x11 kernel) crashes when any
+#    side ends up below 352 px after the trim.
+#  - 384x384 is divisible by 128 (clean for the VAE), >=352 (MS-SSIM safe), and
+#    consistent with the paper's "center-crop to a fixed square" treatment of
+#    CLIC2020 / DIV2K. Latent is 48x48 -> predictable VRAM and runtime.
+TARGET_SIZE = 384
 
-    # 计算裁剪区域的左上角坐标
-    left = (width - target_width) / 2
-    top = (height - target_height) / 2
-    right = (width + target_width) / 2
-    bottom = (height + target_height) / 2
+def prepare_input(img):
+    """Aspect-preserving resize so the SHORT side = TARGET_SIZE, then center-crop
+    to TARGET_SIZE x TARGET_SIZE. Handles all ImageNet sizes uniformly."""
+    w, h = img.size
+    scale = TARGET_SIZE / min(w, h)
+    new_w = max(TARGET_SIZE, int(round(w * scale)))
+    new_h = max(TARGET_SIZE, int(round(h * scale)))
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+    left = (new_w - TARGET_SIZE) // 2
+    top  = (new_h - TARGET_SIZE) // 2
+    return img.crop((left, top, left + TARGET_SIZE, top + TARGET_SIZE))
 
-    # 裁剪并返回图像
-    return image.crop((left, top, right, bottom))
+def _safe_metric(name, fn, *args, **kwargs):
+    """Call a pyiqa metric and return its scalar value, or NaN if it raises.
+    Per-image metric failures (e.g. MS-SSIM size, ROCm op quirks) must not kill
+    the whole 8-bpp loop."""
+    try:
+        v = fn(*args, **kwargs)
+        return v.item() if hasattr(v, "item") else float(v)
+    except Exception as e:
+        print(f"[metric {name} failed: {type(e).__name__}: {e}]", flush=True)
+        return float("nan")
+
+def _nanmean(arr):
+    vals = [v for v in arr if v == v]  # NaN != NaN
+    return sum(vals) / len(vals) if vals else float("nan")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -108,9 +132,7 @@ if __name__ == "__main__":
             img_name, ext = os.path.splitext(os.path.basename(img))
 
             img_H = Image.open(img).convert('RGB')
-            new_width = img_H.width - img_H.width % 128
-            new_height = img_H.height - img_H.height % 128
-            img_H = img_H.resize((new_width, new_height), Image.LANCZOS)
+            img_H = prepare_input(img_H)
 
             # get caption
             lq = tensor_transforms(img_H.copy()).unsqueeze(0).to(device)
@@ -134,28 +156,22 @@ if __name__ == "__main__":
             img_H = torch.tensor(img_H, device="cuda").permute(2, 0, 1).unsqueeze(0)
             img_E, img_H = img_E.type(torch.float32), img_H.type(torch.float32)
 
-            psnr = psnr_metric(img_E, img_H)
-            lpips = lpips_metric(img_E, img_H)
-            # DISTS metric lives on CPU (ROCm fp32 nan workaround) — copy tensors over.
-            dists = dists_metric(img_E.cpu(), img_H.cpu())
-            musiq = musiq_metric(img_E, img_H)
-            clipiqa = clipiqa_metric(img_E, img_H)
-            msssim = msssim_metric(img_E, img_H)
-
-            test_results['psnr'].append(psnr.item())
-            test_results['lpips'].append(lpips.item())
-            test_results['dists'].append(dists.item())
-            test_results['musiq'].append(musiq.item())
-            test_results['clipiqa'].append(clipiqa.item())
-            test_results['msssim'].append(msssim.item())
+            # Per-image metrics — each wrapped so a single failure doesn't kill the run.
+            # DISTS lives on CPU (ROCm fp32 NaN workaround).
+            test_results['psnr'].append(_safe_metric('psnr', psnr_metric, img_E, img_H))
+            test_results['lpips'].append(_safe_metric('lpips', lpips_metric, img_E, img_H))
+            test_results['dists'].append(_safe_metric('dists', dists_metric, img_E.cpu(), img_H.cpu()))
+            test_results['musiq'].append(_safe_metric('musiq', musiq_metric, img_E, img_H))
+            test_results['clipiqa'].append(_safe_metric('clipiqa', clipiqa_metric, img_E, img_H))
+            test_results['msssim'].append(_safe_metric('msssim', msssim_metric, img_E, img_H))
 
         avg_fid = fid_metric(os.path.join(args.output_dir, str(bpp)), args.input_image)
-        avg_psnr = sum(test_results['psnr']) / len(test_results['psnr'])
-        avg_dists = sum(test_results['dists']) / len(test_results['dists'])
-        avg_lpips = sum(test_results['lpips']) / len(test_results['lpips'])
-        avg_musiq = sum(test_results['musiq']) / len(test_results['musiq'])
-        avg_clipiqa = sum(test_results['clipiqa']) / len(test_results['clipiqa'])
-        avg_mssim = sum(test_results['msssim']) / len(test_results['msssim'])
+        avg_psnr = _nanmean(test_results['psnr'])
+        avg_dists = _nanmean(test_results['dists'])
+        avg_lpips = _nanmean(test_results['lpips'])
+        avg_musiq = _nanmean(test_results['musiq'])
+        avg_clipiqa = _nanmean(test_results['clipiqa'])
+        avg_mssim = _nanmean(test_results['msssim'])
         print(bpp, 'PSNR:', avg_psnr, 'MS-SSIM:', avg_mssim, 'DISTS:', avg_dists, 'LPIPS:', avg_lpips, 'MUSIQ:', avg_musiq,
               'CLIP-IQA:', avg_clipiqa, "FID:", avg_fid)
 
